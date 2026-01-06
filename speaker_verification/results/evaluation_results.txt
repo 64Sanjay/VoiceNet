@@ -1,0 +1,24 @@
+CAM++ Evaluation Results
+========================================
+Checkpoint: checkpoints/best_model.pt
+Test Data: data/prepared/test
+Number of Pairs: 10000
+========================================
+Model Config:
+   num_classes: 100
+   n_mels: 80
+   embedding_dim: 192
+   fcm_channels: 16
+   fcm_num_blocks: 2
+   dtdnn_blocks: (6, 12, 8)
+   growth_rate: 16
+   bn_size: 2
+   init_channels: 64
+   cam_reduction: 2
+   segment_length: 100
+   small: True
+========================================
+EER: 0.07%
+MinDCF: 0.0758
+Accuracy: 99.93%
+Threshold: 0.6694
