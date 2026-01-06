@@ -1,0 +1,11 @@
+WSI Evaluation Results
+========================================
+Checkpoint: outputs_v2/best_model.pt
+Test Data: data/librispeech_prepared/test
+Number of Pairs: 3930
+========================================
+EER: 9.19%
+AUC: 0.9655
+Threshold: 0.2968
+FAR: 9.21%
+FRR: 9.17%
