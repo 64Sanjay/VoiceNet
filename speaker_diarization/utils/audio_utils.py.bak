@@ -1,0 +1,217 @@
+"""
+Audio utilities for speaker diarization.
+Handles audio I/O, resampling, and basic processing.
+"""
+
+from typing import List, Optional, Tuple, Union
+
+import torch
+import torchaudio
+import numpy as np
+from pathlib import Path
+import warnings
+
+
+def get_audio_info(path: Union[str, Path]) -> Tuple[int, int]:
+    """
+    Get audio file info (sample rate and number of frames).
+    Compatible with different torchaudio versions.
+    """
+    path = str(path)
+    
+    # Try new API first (torchaudio >= 2.0)
+    try:
+        metadata = torchaudio.info(path)
+        return metadata.sample_rate, metadata.num_frames
+    except (AttributeError, TypeError):
+        pass
+    
+    # Fallback: load the file to get info
+    waveform, sample_rate = torchaudio.load(path)
+    num_frames = waveform.shape[-1]
+    return sample_rate, num_frames
+
+
+class AudioProcessor:
+    """Handles audio loading, saving, and basic processing."""
+    
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        mono: bool = True,
+        normalize: bool = True,
+    ):
+        self.sample_rate = sample_rate
+        self.mono = mono
+        self.normalize = normalize
+    
+    def load(
+        self,
+        path: Union[str, Path],
+        start: Optional[float] = None,
+        duration: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, int]:
+        path = Path(path)
+        
+        if not path.exists():
+            raise FileNotFoundError(f"Audio file not found: {path}")
+        
+        # Just load the whole file first
+        waveform, original_sr = torchaudio.load(str(path))
+        
+        # Handle start/duration
+        if start is not None or duration is not None:
+            start_sample = int((start or 0) * original_sr)
+            if duration is not None:
+                end_sample = start_sample + int(duration * original_sr)
+            else:
+                end_sample = waveform.shape[-1]
+            waveform = waveform[:, start_sample:end_sample]
+        
+        # Convert to mono
+        if self.mono and waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        
+        # Resample if necessary
+        if original_sr != self.sample_rate:
+            waveform = torchaudio.functional.resample(
+                waveform, original_sr, self.sample_rate
+            )
+        
+        # Normalize
+        if self.normalize:
+            waveform = self._normalize(waveform)
+        
+        return waveform, self.sample_rate
+    
+    def _normalize(self, waveform: torch.Tensor) -> torch.Tensor:
+        max_val = waveform.abs().max()
+        if max_val > 0:
+            waveform = waveform / max_val
+        return waveform
+    
+    def save(
+        self,
+        waveform: torch.Tensor,
+        path: Union[str, Path],
+        sample_rate: Optional[int] = None,
+    ) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sr = sample_rate or self.sample_rate
+        torchaudio.save(str(path), waveform, sr)
+    
+    def get_duration(self, path: Union[str, Path]) -> float:
+        """Get audio duration in seconds."""
+        waveform, sr = torchaudio.load(str(path))
+        return waveform.shape[-1] / sr
+    
+    def segment(
+        self,
+        waveform: torch.Tensor,
+        segment_duration: float,
+        segment_step: Optional[float] = None,
+        drop_last: bool = False,
+    ) -> List[torch.Tensor]:
+        if segment_step is None:
+            segment_step = segment_duration
+        
+        segment_samples = int(segment_duration * self.sample_rate)
+        step_samples = int(segment_step * self.sample_rate)
+        
+        total_samples = waveform.shape[-1]
+        segments = []
+        
+        start = 0
+        while start < total_samples:
+            end = start + segment_samples
+            segment = waveform[..., start:end]
+            
+            if segment.shape[-1] < segment_samples:
+                if drop_last:
+                    break
+                padding = segment_samples - segment.shape[-1]
+                segment = torch.nn.functional.pad(segment, (0, padding))
+            
+            segments.append(segment)
+            start += step_samples
+        
+        return segments
+    
+    def concat(self, segments: List[torch.Tensor]) -> torch.Tensor:
+        return torch.cat(segments, dim=-1)
+
+
+def compute_energy(
+    waveform: torch.Tensor,
+    frame_length: int = 400,
+    hop_length: int = 160,
+) -> torch.Tensor:
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    frames = waveform.unfold(-1, frame_length, hop_length)
+    energy = (frames ** 2).sum(dim=-1)
+    return energy.squeeze(0) if energy.shape[0] == 1 else energy
+
+
+def simple_vad(
+    waveform: torch.Tensor,
+    sample_rate: int = 16000,
+    energy_threshold: float = 0.01,
+    frame_length: float = 0.025,
+    hop_length: float = 0.010,
+) -> torch.Tensor:
+    frame_samples = int(frame_length * sample_rate)
+    hop_samples = int(hop_length * sample_rate)
+    energy = compute_energy(waveform, frame_samples, hop_samples)
+    max_energy = energy.max()
+    if max_energy > 0:
+        energy = energy / max_energy
+    vad_mask = energy > energy_threshold
+    return vad_mask
+
+
+def apply_vad_mask(
+    waveform: torch.Tensor,
+    vad_mask: torch.Tensor,
+    sample_rate: int = 16000,
+    hop_length: float = 0.010,
+) -> List[Tuple[float, float]]:
+    hop_samples = int(hop_length * sample_rate)
+    segments = []
+    in_speech = False
+    start = 0
+    
+    for i, is_speech in enumerate(vad_mask):
+        if is_speech and not in_speech:
+            start = i * hop_samples / sample_rate
+            in_speech = True
+        elif not is_speech and in_speech:
+            end = i * hop_samples / sample_rate
+            segments.append((start, end))
+            in_speech = False
+    
+    if in_speech:
+        end = len(vad_mask) * hop_samples / sample_rate
+        segments.append((start, end))
+    
+    return segments
+
+
+def mix_audio(
+    signal: torch.Tensor,
+    noise: torch.Tensor,
+    snr_db: float,
+) -> torch.Tensor:
+    if noise.shape[-1] < signal.shape[-1]:
+        repeats = signal.shape[-1] // noise.shape[-1] + 1
+        noise = noise.repeat(1, repeats)[..., :signal.shape[-1]]
+    else:
+        noise = noise[..., :signal.shape[-1]]
+    
+    signal_power = (signal ** 2).mean()
+    noise_power = (noise ** 2).mean()
+    snr_linear = 10 ** (snr_db / 10)
+    scale = torch.sqrt(signal_power / (snr_linear * noise_power + 1e-8))
+    mixed = signal + scale * noise
+    return mixed

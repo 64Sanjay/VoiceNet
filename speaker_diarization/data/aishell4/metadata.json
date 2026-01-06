@@ -1,0 +1,7 @@
+{
+  "train_files": 172,
+  "val_files": 19,
+  "test_files": 20,
+  "total_audio": 211,
+  "total_rttm": 211
+}
